@@ -1,0 +1,6 @@
+{
+  "summary": "Implementation plan for adding NotebookLM-style local material upload/ingestion for local RAG with selectable source checkboxes, and a dual-mode research workspace dividing Local Notebook RAG from Direct Internet/Live AI Research.",
+  "updatedAt": "2026-11-05T15:02:53.555777097Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

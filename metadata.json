@@ -1,0 +1,8 @@
+{
+  "name": "Green AI",
+  "description": "Evidence-aware African Traditional Medicine research and knowledge platform",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
