@@ -30,10 +30,13 @@ import com.example.data.model.SavedBookmark
 import com.example.data.model.SourceReference
 import com.example.data.repository.PlantRepository
 import com.example.domain.DocumentChunker
+import com.example.domain.DocumentIngestionEngine
+import com.example.domain.DocumentIngestionProgress
 import com.example.domain.EvidenceGraphBuilder
 import com.example.ui.theme.AppThemeMode
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -41,6 +44,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 enum class AppNavTab(val title: String, val subtitle: String) {
@@ -82,6 +86,18 @@ data class IngestionFormState(
     val successMessage: String? = null,
     val errorMessage: String? = null
 )
+
+sealed interface DocumentIngestionUiState {
+    data object Idle : DocumentIngestionUiState
+    data class InProgress(val progress: DocumentIngestionProgress) : DocumentIngestionUiState
+    data class Success(
+        val fileName: String,
+        val fileSizeBytes: Long,
+        val chunkCount: Int,
+        val wordCount: Int
+    ) : DocumentIngestionUiState
+    data class Error(val message: String) : DocumentIngestionUiState
+}
 
 class GreenAiViewModel(
     private val repository: PlantRepository,
@@ -161,32 +177,54 @@ class GreenAiViewModel(
         }
     }
 
+    private val _documentIngestionState = MutableStateFlow<DocumentIngestionUiState>(DocumentIngestionUiState.Idle)
+    val documentIngestionState: StateFlow<DocumentIngestionUiState> = _documentIngestionState.asStateFlow()
+
+    private var activeIngestionJob: Job? = null
+
+    fun clearDocumentIngestionState() {
+        if (_documentIngestionState.value !is DocumentIngestionUiState.InProgress) {
+            _documentIngestionState.value = DocumentIngestionUiState.Idle
+        }
+    }
+
+    fun cancelDocumentIngestion() {
+        activeIngestionJob?.cancel()
+    }
+
     fun importPastedNote(title: String, content: String, author: String) {
         val cleanTitle = title.trim().ifBlank { "Untitled Research Note" }
         val cleanContent = content.trim()
         if (cleanContent.isBlank()) return
 
         val sourceId = "NOTE-" + UUID.randomUUID().toString().take(8)
-        val chunks = DocumentChunker.chunkText(
-            sourceId = sourceId,
-            sourceTitle = cleanTitle,
-            authorOrOrigin = author.trim().ifBlank { "Pasted Research Note" },
-            rawText = cleanContent
-        )
-        val wordCount = cleanContent.split(Regex("\\s+")).filter { it.isNotEmpty() }.size
-
-        val source = NotebookSource(
-            id = sourceId,
-            title = cleanTitle,
-            authorOrOrigin = author.trim().ifBlank { "Pasted Research Note" },
-            sourceType = "PASTED_NOTE",
-            rawContent = cleanContent,
-            chunkCount = chunks.size,
-            wordCount = wordCount,
-            isActive = true
-        )
+        val authorOrigin = author.trim().ifBlank { "Pasted Research Note" }
 
         viewModelScope.launch {
+            val chunks = withContext(kotlinx.coroutines.Dispatchers.Default) {
+                DocumentChunker.chunkText(
+                    sourceId = sourceId,
+                    sourceTitle = cleanTitle,
+                    authorOrOrigin = authorOrigin,
+                    rawText = cleanContent
+                )
+            }
+            val wordCount = cleanContent.split(Regex("\\s+")).filter { it.isNotEmpty() }.size
+            val preview = cleanContent.take(DocumentChunker.MAX_PREVIEW_CHARS)
+
+            val source = NotebookSource(
+                id = sourceId,
+                title = cleanTitle,
+                authorOrOrigin = authorOrigin,
+                sourceType = "PASTED_NOTE",
+                rawContent = preview,
+                chunkCount = chunks.size,
+                wordCount = wordCount,
+                fileSizeBytes = cleanContent.toByteArray(Charsets.UTF_8).size.toLong(),
+                formatLabel = "NOTE",
+                isActive = true
+            )
+
             repository.insertNotebookSource(source, chunks)
             val updated = _activeSourceIds.value.toMutableSet()
             updated.add(sourceId)
@@ -195,50 +233,65 @@ class GreenAiViewModel(
     }
 
     fun importDocumentFile(uri: Uri, context: Context) {
-        viewModelScope.launch {
+        if (_documentIngestionState.value is DocumentIngestionUiState.InProgress) {
+            Toast.makeText(context, "Another document upload is currently in progress.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val sourceId = "DOC-" + UUID.randomUUID().toString().take(8)
+        activeIngestionJob = viewModelScope.launch {
+            _documentIngestionState.value = DocumentIngestionUiState.InProgress(
+                DocumentIngestionProgress(
+                    fileName = "Selected Document",
+                    fileSizeBytes = 0L,
+                    progressFraction = null,
+                    statusMessage = "Validating document format & storage..."
+                )
+            )
+
             try {
-                var fileName = "Imported Document"
-                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex != -1 && cursor.moveToFirst()) {
-                        fileName = cursor.getString(nameIndex)
-                    }
-                }
-
-                val content = context.contentResolver.openInputStream(uri)?.use { inputStream ->
-                    BufferedReader(InputStreamReader(inputStream)).readText()
-                } ?: return@launch
-
-                val cleanContent = content.trim()
-                if (cleanContent.isBlank()) return@launch
-
-                val sourceId = "DOC-" + UUID.randomUUID().toString().take(8)
-                val chunks = DocumentChunker.chunkText(
+                val source = DocumentIngestionEngine.ingestUri(
+                    context = context,
+                    uri = uri,
                     sourceId = sourceId,
-                    sourceTitle = fileName,
-                    authorOrOrigin = "Document File Upload",
-                    rawText = cleanContent
-                )
-                val wordCount = cleanContent.split(Regex("\\s+")).filter { it.isNotEmpty() }.size
-
-                val source = NotebookSource(
-                    id = sourceId,
-                    title = fileName,
-                    authorOrOrigin = "File: $fileName",
-                    sourceType = "FILE_UPLOAD",
-                    rawContent = cleanContent,
-                    chunkCount = chunks.size,
-                    wordCount = wordCount,
-                    isActive = true
+                    onBatchFlush = { chunkBatch ->
+                        repository.insertChunkBatch(chunkBatch)
+                    },
+                    onProgress = { progress ->
+                        _documentIngestionState.value = DocumentIngestionUiState.InProgress(progress)
+                    }
                 )
 
-                repository.insertNotebookSource(source, chunks)
+                repository.insertNotebookSourceMetadata(source)
                 val updated = _activeSourceIds.value.toMutableSet()
                 updated.add(sourceId)
                 _activeSourceIds.value = updated
-                Toast.makeText(context, "Added $fileName (${chunks.size} chunks) to Notebook Sources", Toast.LENGTH_SHORT).show()
+
+                _documentIngestionState.value = DocumentIngestionUiState.Success(
+                    fileName = source.title,
+                    fileSizeBytes = source.fileSizeBytes,
+                    chunkCount = source.chunkCount,
+                    wordCount = source.wordCount
+                )
+                Toast.makeText(
+                    context,
+                    "Added ${source.title} (${source.chunkCount} chunks) to Notebook Sources",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } catch (ce: CancellationException) {
+                withContext(NonCancellable) {
+                    repository.deleteNotebookSource(sourceId)
+                }
+                _documentIngestionState.value = DocumentIngestionUiState.Error("Document upload cancelled and partial data cleaned up.")
             } catch (e: Exception) {
-                Toast.makeText(context, "Failed to read document: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                withContext(NonCancellable) {
+                    repository.deleteNotebookSource(sourceId)
+                }
+                val friendlyError = e.localizedMessage ?: "Failed to index document."
+                _documentIngestionState.value = DocumentIngestionUiState.Error(friendlyError)
+                Toast.makeText(context, friendlyError, Toast.LENGTH_LONG).show()
+            } finally {
+                activeIngestionJob = null
             }
         }
     }

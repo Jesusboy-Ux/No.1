@@ -7,6 +7,10 @@ import java.util.Locale
 
 object DocumentChunker {
 
+    const val DEFAULT_WORDS_PER_CHUNK = 180
+    const val DEFAULT_BATCH_FLUSH_SIZE = 250
+    const val MAX_PREVIEW_CHARS = 1500
+
     private val stopWords = setOf(
         "a", "an", "the", "is", "are", "was", "were", "in", "on", "at", "to", "for",
         "of", "with", "by", "about", "what", "which", "how", "can", "could", "should",
@@ -19,7 +23,7 @@ object DocumentChunker {
         sourceTitle: String,
         authorOrOrigin: String,
         rawText: String,
-        targetWordsPerChunk: Int = 180
+        targetWordsPerChunk: Int = DEFAULT_WORDS_PER_CHUNK
     ): List<DocumentChunk> {
         val cleanText = rawText.trim()
         if (cleanText.isBlank()) return emptyList()
@@ -61,24 +65,154 @@ object DocumentChunker {
         val currentYear = Calendar.getInstance().get(Calendar.YEAR)
 
         return chunkTexts.mapIndexed { index, text ->
-            val detectedTier = detectEvidenceTier(text)
-            val keywords = extractKeywords(text, sourceTitle)
-
-            DocumentChunk(
-                id = "${sourceId}_CHK_${index + 1}",
-                plantId = sourceId,
-                plantScientificName = sourceTitle,
+            buildChunk(
                 sourceId = sourceId,
                 sourceTitle = sourceTitle,
-                authors = authorOrOrigin.ifBlank { "Personal Research Note" },
-                year = currentYear,
-                citation = "${authorOrOrigin.ifBlank { "Notebook Document" }} ($sourceTitle)",
-                section = "Section ${index + 1}",
+                authorOrOrigin = authorOrOrigin,
+                chunkIndex = index + 1,
                 text = text,
-                evidenceTier = detectedTier,
-                keywords = keywords
+                year = currentYear
             )
         }
+    }
+
+    /**
+     * Streaming incremental chunker designed for large documents (up to 100 MB).
+     * Never retains the full document or full chunk list in memory: flushes completed
+     * batches directly to the caller (e.g., Room SQLite) every [batchFlushSize] chunks.
+     */
+    class StreamingChunkAccumulator(
+        private val sourceId: String,
+        private val sourceTitle: String,
+        private val authorOrOrigin: String,
+        private val targetWordsPerChunk: Int = DEFAULT_WORDS_PER_CHUNK,
+        private val batchFlushSize: Int = DEFAULT_BATCH_FLUSH_SIZE,
+        private val onBatchReady: suspend (List<DocumentChunk>) -> Unit
+    ) {
+        private val currentWords = ArrayList<String>(targetWordsPerChunk + 32)
+        private val pendingBatch = ArrayList<DocumentChunk>(batchFlushSize)
+        private val previewBuilder = StringBuilder(MAX_PREVIEW_CHARS)
+        private val wordTokenBuilder = StringBuilder(64)
+        private val currentYear = Calendar.getInstance().get(Calendar.YEAR)
+        private val overlapWordsCount = (targetWordsPerChunk * 0.15).toInt().coerceAtLeast(15)
+
+        var totalWords: Int = 0
+            private set
+
+        var totalChunks: Int = 0
+            private set
+
+        fun getPreviewExcerpt(): String = previewBuilder.toString().trim()
+
+        suspend fun appendText(text: String) {
+            if (text.isEmpty()) return
+
+            // Capture compact preview snippet (< 1.5 KB) for SQLite metadata row
+            if (previewBuilder.length < MAX_PREVIEW_CHARS) {
+                val remaining = MAX_PREVIEW_CHARS - previewBuilder.length
+                val slice = if (text.length <= remaining) text else text.substring(0, remaining)
+                previewBuilder.append(slice)
+                if (previewBuilder.length < MAX_PREVIEW_CHARS && !text.endsWith('\n')) {
+                    previewBuilder.append('\n')
+                }
+            }
+
+            // Stream characters directly into word tokens so huge single lines (e.g. JSON/CSV) never OOM Regex
+            for (i in text.indices) {
+                val ch = text[i]
+                if (ch.isWhitespace()) {
+                    if (wordTokenBuilder.isNotEmpty()) {
+                        pushWord(wordTokenBuilder.toString())
+                        wordTokenBuilder.setLength(0)
+                    }
+                } else {
+                    if (wordTokenBuilder.length < 120) {
+                        wordTokenBuilder.append(ch)
+                    }
+                }
+            }
+        }
+
+        suspend fun finish() {
+            if (wordTokenBuilder.isNotEmpty()) {
+                pushWord(wordTokenBuilder.toString())
+                wordTokenBuilder.setLength(0)
+            }
+
+            if (currentWords.isNotEmpty()) {
+                emitCurrentWindow(keepOverlap = false)
+            }
+
+            if (pendingBatch.isNotEmpty()) {
+                val toFlush = pendingBatch.toList()
+                pendingBatch.clear()
+                onBatchReady(toFlush)
+            }
+        }
+
+        private suspend fun pushWord(word: String) {
+            totalWords++
+            currentWords.add(word)
+            if (currentWords.size >= targetWordsPerChunk) {
+                emitCurrentWindow(keepOverlap = true)
+            }
+        }
+
+        private suspend fun emitCurrentWindow(keepOverlap: Boolean) {
+            val chunkText = currentWords.joinToString(" ")
+            totalChunks++
+            pendingBatch.add(
+                buildChunk(
+                    sourceId = sourceId,
+                    sourceTitle = sourceTitle,
+                    authorOrOrigin = authorOrOrigin,
+                    chunkIndex = totalChunks,
+                    text = chunkText,
+                    year = currentYear
+                )
+            )
+
+            if (keepOverlap && currentWords.size > overlapWordsCount) {
+                val tail = currentWords.subList(currentWords.size - overlapWordsCount, currentWords.size).toList()
+                currentWords.clear()
+                currentWords.addAll(tail)
+            } else {
+                currentWords.clear()
+            }
+
+            if (pendingBatch.size >= batchFlushSize) {
+                val toFlush = pendingBatch.toList()
+                pendingBatch.clear()
+                onBatchReady(toFlush)
+            }
+        }
+    }
+
+    internal fun buildChunk(
+        sourceId: String,
+        sourceTitle: String,
+        authorOrOrigin: String,
+        chunkIndex: Int,
+        text: String,
+        year: Int
+    ): DocumentChunk {
+        val detectedTier = detectEvidenceTier(text)
+        val keywords = extractKeywords(text, sourceTitle)
+
+        return DocumentChunk(
+            id = "${sourceId}_CHK_$chunkIndex",
+            plantId = sourceId,
+            plantScientificName = sourceTitle,
+            sourceId = sourceId,
+            sourceTitle = sourceTitle,
+            authors = authorOrOrigin.ifBlank { "Personal Research Note" },
+            year = year,
+            citation = "${authorOrOrigin.ifBlank { "Notebook Document" }} ($sourceTitle)",
+            section = "Section $chunkIndex",
+            text = text,
+            evidenceTier = detectedTier,
+            keywords = keywords
+        )
     }
 
     private fun detectEvidenceTier(text: String): EvidenceLevel {

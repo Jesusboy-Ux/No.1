@@ -149,6 +149,7 @@ fun GreenAiApp(viewModel: GreenAiViewModel) {
     val researchMode by viewModel.researchMode.collectAsStateWithLifecycle()
     val notebookSources by viewModel.notebookSources.collectAsStateWithLifecycle()
     val activeSourceIds by viewModel.activeSourceIds.collectAsStateWithLifecycle()
+    val documentIngestionState by viewModel.documentIngestionState.collectAsStateWithLifecycle()
     val evidenceGraphData by viewModel.evidenceGraphData.collectAsStateWithLifecycle()
     val selectedGraphNode by viewModel.selectedGraphNode.collectAsStateWithLifecycle()
     val graphFilterType by viewModel.graphFilterType.collectAsStateWithLifecycle()
@@ -606,11 +607,14 @@ fun GreenAiApp(viewModel: GreenAiViewModel) {
                                 researchMode = researchMode,
                                 notebookSources = notebookSources,
                                 activeSourceIds = activeSourceIds,
+                                documentIngestionState = documentIngestionState,
                                 onSelectResearchMode = { mode -> viewModel.setResearchMode(mode) },
                                 onToggleSourceActive = { sourceId -> viewModel.toggleSourceActive(sourceId) },
                                 onSetAllSourcesActive = { active -> viewModel.setAllSourcesActive(active) },
                                 onImportPastedNote = { title, content, author -> viewModel.importPastedNote(title, content, author) },
                                 onImportDocumentFile = { uri -> viewModel.importDocumentFile(uri, context) },
+                                onCancelDocumentIngestion = { viewModel.cancelDocumentIngestion() },
+                                onDismissIngestionState = { viewModel.clearDocumentIngestionState() },
                                 onDeleteNotebookSource = { sourceId -> viewModel.deleteNotebookSource(sourceId) },
                                 onSendMessage = { query -> viewModel.askQuestion(query) },
                                 onSelectCitation = { chunk -> viewModel.selectCitationChunk(chunk) },

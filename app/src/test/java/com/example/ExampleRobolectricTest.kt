@@ -249,5 +249,79 @@ class ExampleRobolectricTest {
         assertEquals("Research Lab", lab.title)
         assertEquals("Evidence Graph", graph.title)
     }
+
+    @Test
+    fun `test StreamingChunkAccumulator processes over 2MB text in batches with bounded SQLite preview`() =
+        kotlinx.coroutines.test.runTest {
+            val flushedBatchSizes = mutableListOf<Int>()
+            val accumulator = com.example.domain.DocumentChunker.StreamingChunkAccumulator(
+                sourceId = "DOC-LARGE-01",
+                sourceTitle = "African Pharmacopoeia Monograph",
+                authorOrOrigin = "PDF: Monograph.pdf",
+                batchFlushSize = 250,
+                onBatchReady = { batch ->
+                    flushedBatchSizes.add(batch.size)
+                }
+            )
+
+            // Stream > 2.5 MB of botanical research prose in 16KB slices
+            val sampleParagraph =
+                "Artemisia afra contains volatile monoterpenes including alpha-thujone, beta-thujone, and 1,8-cineole with documented in vitro antimicrobial activity across southern African ethnobotanical surveys.\n"
+            val block = sampleParagraph.repeat(80) // ~14.7 KB per block
+            repeat(180) { // ~2.65 MB total text (> 2 MB SQLite CursorWindow limit)
+                accumulator.appendText(block)
+            }
+            accumulator.finish()
+
+            // SQLite metadata preview must stay strictly under MAX_PREVIEW_CHARS (1500 chars)
+            assertTrue(accumulator.getPreviewExcerpt().length <= com.example.domain.DocumentChunker.MAX_PREVIEW_CHARS)
+            assertTrue(accumulator.totalChunks > 500)
+            assertTrue(accumulator.totalWords > 300_000)
+            // Verify batch flushing occurred incrementally (multiple batches of 250 + final tail)
+            assertTrue(flushedBatchSizes.size >= 3)
+            assertEquals(250, flushedBatchSizes.first())
+        }
+
+    @Test
+    fun `test DocumentIngestionEngine format detection and 100MB limit validation`() {
+        assertEquals(
+            com.example.domain.DocumentFormat.PDF,
+            com.example.domain.DocumentIngestionEngine.detectFormat("ethnobotany_review.pdf", "application/pdf")
+        )
+        assertEquals(
+            com.example.domain.DocumentFormat.CSV,
+            com.example.domain.DocumentIngestionEngine.detectFormat("compounds.csv", "application/octet-stream")
+        )
+        assertEquals(
+            com.example.domain.DocumentFormat.JSON,
+            com.example.domain.DocumentIngestionEngine.detectFormat("monographs.json", null)
+        )
+
+        var unsupportedRejected = false
+        try {
+            com.example.domain.DocumentIngestionEngine.detectFormat("photo.png", "image/png")
+        } catch (_: com.example.domain.UnsupportedDocumentFormatException) {
+            unsupportedRejected = true
+        }
+        assertTrue(unsupportedRejected)
+
+        // 100 MB accepted when storage suffices
+        com.example.domain.DocumentIngestionEngine.validateSizeAndStorage(
+            fileSizeBytes = 100L * 1024L * 1024L,
+            availableDiskBytes = 500L * 1024L * 1024L
+        )
+
+        // > 100 MB cleanly rejected
+        var tooLargeRejected = false
+        try {
+            com.example.domain.DocumentIngestionEngine.validateSizeAndStorage(
+                fileSizeBytes = 101L * 1024L * 1024L,
+                availableDiskBytes = 500L * 1024L * 1024L
+            )
+        } catch (_: com.example.domain.DocumentTooLargeException) {
+            tooLargeRejected = true
+        }
+        assertTrue(tooLargeRejected)
+    }
 }
 

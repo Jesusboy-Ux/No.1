@@ -4,6 +4,8 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.RawQuery
+import androidx.sqlite.db.SupportSQLiteQuery
 import com.example.data.model.DocumentChunk
 import com.example.data.model.MedicinalPlant
 import com.example.data.model.NotebookSource
@@ -47,6 +49,9 @@ interface ChunkDao {
 
     @Query("DELETE FROM document_chunks WHERE sourceId = :sourceId")
     suspend fun deleteChunksBySourceId(sourceId: String)
+
+    @RawQuery
+    suspend fun getCandidateChunks(query: SupportSQLiteQuery): List<DocumentChunk>
 }
 
 @Dao

@@ -61,6 +61,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -91,6 +92,7 @@ import com.example.data.model.ChatSender
 import com.example.data.model.DocumentChunk
 import com.example.data.model.NotebookSource
 import com.example.data.model.ResearchMode
+import com.example.domain.DocumentIngestionEngine
 import com.example.ui.components.AiMarkdownResponseView
 import com.example.ui.components.CitationChip
 import com.example.ui.components.EvidenceBadge
@@ -102,6 +104,7 @@ import com.example.ui.theme.GreenAiColors
 import com.example.ui.theme.GreenAiTheme
 import com.example.ui.theme.PrimaryDeepTeal
 import com.example.ui.theme.PureWhite
+import com.example.ui.viewmodel.DocumentIngestionUiState
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -111,11 +114,14 @@ fun ResearchScreen(
     researchMode: ResearchMode,
     notebookSources: List<NotebookSource>,
     activeSourceIds: Set<String>,
+    documentIngestionState: DocumentIngestionUiState = DocumentIngestionUiState.Idle,
     onSelectResearchMode: (ResearchMode) -> Unit,
     onToggleSourceActive: (String) -> Unit,
     onSetAllSourcesActive: (Boolean) -> Unit,
     onImportPastedNote: (title: String, content: String, author: String) -> Unit,
     onImportDocumentFile: (Uri) -> Unit,
+    onCancelDocumentIngestion: () -> Unit = {},
+    onDismissIngestionState: () -> Unit = {},
     onDeleteNotebookSource: (String) -> Unit,
     onSendMessage: (String) -> Unit,
     onSelectCitation: (DocumentChunk) -> Unit,
@@ -163,19 +169,25 @@ fun ResearchScreen(
         NotebookSourcesDialog(
             sources = notebookSources,
             activeSourceIds = activeSourceIds,
+            ingestionState = documentIngestionState,
             onToggleSource = onToggleSourceActive,
             onSetAllActive = onSetAllSourcesActive,
             onOpenFilePicker = {
                 filePickerLauncher.launch(
                     arrayOf(
+                        "application/pdf",
                         "text/plain",
                         "text/markdown",
                         "text/csv",
+                        "text/comma-separated-values",
                         "application/json",
+                        "text/*",
                         "*/*"
                     )
                 )
             },
+            onCancelIngestion = onCancelDocumentIngestion,
+            onDismissIngestionState = onDismissIngestionState,
             onSavePastedNote = onImportPastedNote,
             onDeleteSource = onDeleteNotebookSource,
             onDismiss = { showSourcesDialog = false },
@@ -911,9 +923,12 @@ fun ResearchMessageItem(
 fun NotebookSourcesDialog(
     sources: List<NotebookSource>,
     activeSourceIds: Set<String>,
+    ingestionState: DocumentIngestionUiState = DocumentIngestionUiState.Idle,
     onToggleSource: (String) -> Unit,
     onSetAllActive: (Boolean) -> Unit,
     onOpenFilePicker: () -> Unit,
+    onCancelIngestion: () -> Unit = {},
+    onDismissIngestionState: () -> Unit = {},
     onSavePastedNote: (title: String, content: String, author: String) -> Unit,
     onDeleteSource: (String) -> Unit,
     onDismiss: () -> Unit,
@@ -973,6 +988,8 @@ fun NotebookSourcesDialog(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
+                val isUploading = ingestionState is DocumentIngestionUiState.InProgress
+
                 // Actions Bar: Upload File & Paste Note
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -980,6 +997,7 @@ fun NotebookSourcesDialog(
                 ) {
                     Button(
                         onClick = onOpenFilePicker,
+                        enabled = !isUploading,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (colors.isDark) colors.brandAccent else colors.brandPrimary,
                             contentColor = if (colors.isDark) PrimaryDeepTeal else PureWhite
@@ -996,7 +1014,11 @@ fun NotebookSourcesDialog(
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Add Document", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            if (isUploading) "Indexing..." else "Add Document",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
 
                     OutlinedButton(
@@ -1021,6 +1043,144 @@ fun NotebookSourcesDialog(
                             color = if (colors.isDark) colors.brandAccent else colors.brandPrimary
                         )
                     }
+                }
+
+                // Live Upload Progress / Result Feedback Banner
+                when (ingestionState) {
+                    is DocumentIngestionUiState.InProgress -> {
+                        val prog = ingestionState.progress
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = colors.surfaceElevated),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(0.8.dp, colors.brandAccent.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                .testTag("ingestion_progress_card")
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = prog.fileName,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = colors.textPrimary,
+                                        maxLines = 1,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    TextButton(
+                                        onClick = onCancelIngestion,
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                        modifier = Modifier.testTag("cancel_upload_button")
+                                    ) {
+                                        Text(
+                                            text = "Cancel",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFFE57373)
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = prog.statusMessage,
+                                    fontSize = 10.sp,
+                                    color = colors.textSecondary
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                if (prog.progressFraction != null) {
+                                    LinearProgressIndicator(
+                                        progress = { prog.progressFraction },
+                                        color = if (colors.isDark) colors.brandAccent else colors.brandPrimary,
+                                        trackColor = colors.borderSubtle,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                } else {
+                                    LinearProgressIndicator(
+                                        color = if (colors.isDark) colors.brandAccent else colors.brandPrimary,
+                                        trackColor = colors.borderSubtle,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    is DocumentIngestionUiState.Error -> {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Surface(
+                            color = Color(0xFFD32F2F).copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(0.8.dp, Color(0xFFD32F2F).copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                .testTag("ingestion_error_banner")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = ingestionState.message,
+                                    fontSize = 11.sp,
+                                    color = if (colors.isDark) Color(0xFFFFB4AB) else Color(0xFFB71C1C),
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(
+                                    onClick = onDismissIngestionState,
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Dismiss error",
+                                        tint = if (colors.isDark) Color(0xFFFFB4AB) else Color(0xFFB71C1C),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    is DocumentIngestionUiState.Success -> {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Surface(
+                            color = colors.brandAccent.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(0.8.dp, colors.brandAccent.copy(alpha = 0.45f), RoundedCornerShape(8.dp))
+                                .testTag("ingestion_success_banner")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Indexed ${ingestionState.fileName} (${DocumentIngestionEngine.formatBytes(ingestionState.fileSizeBytes)} • ${ingestionState.chunkCount} chunks)",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = colors.textPrimary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(
+                                    onClick = onDismissIngestionState,
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Dismiss notice",
+                                        tint = colors.textSecondary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    DocumentIngestionUiState.Idle -> Unit
                 }
 
                 // Collapsible Paste Note Form
@@ -1154,11 +1314,14 @@ fun NotebookSourcesDialog(
 
                     // User Imported Sources
                     items(sources, key = { it.id }) { src ->
+                        val sizePart = if (src.fileSizeBytes > 0L) {
+                            " • ${DocumentIngestionEngine.formatBytes(src.fileSizeBytes)}"
+                        } else ""
                         SourceItemRow(
                             title = src.title,
                             authorOrOrigin = src.authorOrOrigin,
-                            tag = if (src.sourceType == "FILE_UPLOAD") "FILE" else "NOTE",
-                            details = "${src.chunkCount} chunks • ${src.wordCount} words",
+                            tag = src.formatLabel.ifBlank { if (src.sourceType == "FILE_UPLOAD") "FILE" else "NOTE" },
+                            details = "${src.chunkCount} chunks • ${src.wordCount} words$sizePart",
                             isActive = activeSourceIds.contains(src.id),
                             canDelete = true,
                             onToggle = { onToggleSource(src.id) },
@@ -1188,7 +1351,7 @@ fun NotebookSourcesDialog(
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = "No custom documents yet. Upload files (.txt, .md, .csv) or paste field study notes above.",
+                                        text = "No custom documents yet. Upload .txt, .md, .csv, .json, or .pdf files (up to 100 MB) or paste field study notes above.",
                                         fontSize = 11.sp,
                                         color = colors.textSecondary,
                                         lineHeight = 15.sp

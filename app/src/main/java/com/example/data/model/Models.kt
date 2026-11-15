@@ -1,6 +1,7 @@
 package com.example.data.model
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
 enum class EvidenceLevel(val label: String, val description: String) {
@@ -44,7 +45,13 @@ data class SourceReference(
     val evidenceType: String
 )
 
-@Entity(tableName = "document_chunks")
+@Entity(
+    tableName = "document_chunks",
+    indices = [
+        Index(value = ["sourceId"]),
+        Index(value = ["plantId"])
+    ]
+)
 data class DocumentChunk(
     @PrimaryKey val id: String,
     val plantId: String,
@@ -130,9 +137,11 @@ data class NotebookSource(
     val title: String,
     val authorOrOrigin: String = "Personal Research",
     val sourceType: String = "PASTED_NOTE", // "FILE_UPLOAD" or "PASTED_NOTE"
-    val rawContent: String,
+    val rawContent: String, // Bounded preview excerpt (< 2 KB) to stay well below SQLite's 2 MB CursorWindow limit
     val chunkCount: Int,
     val wordCount: Int,
+    val fileSizeBytes: Long = 0L,
+    val formatLabel: String = "NOTE", // "PDF", "TXT", "MD", "CSV", "JSON", "NOTE"
     val isActive: Boolean = true,
     val timestamp: Long = System.currentTimeMillis()
 )
