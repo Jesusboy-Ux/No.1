@@ -1,10 +1,12 @@
-
 name: Build Green AI APK
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -14,11 +16,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
@@ -27,25 +29,133 @@ jobs:
 
       - name: Generate Gradle Wrapper
         run: gradle wrapper --gradle-version 9.3.1
-        
-      - name: Generate debug keystore
+
+      - name: Cache persistent debug keystore
+        id: cache-keystore
+        uses: actions/cache@v4
+        with:
+          path: debug.keystore
+          key: green-ai-debug-keystore-v1
+
+      - name: Ensure debug keystore exists
         run: |
-          keytool -genkeypair -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-            
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          else
+            echo "Reusing cached debug.keystore"
+          fi
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleDebug --no-daemon
 
-      - name: Upload APK
+      - name: Align, sign (v1/v2/v3), and verify APK for Android 14
+        id: package-apk
+        run: |
+          set -euo pipefail
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_DIR" ] || [ ! -d "$SDK_DIR/build-tools" ]; then
+            echo "Android SDK build-tools not found in SDK_DIR=$SDK_DIR"
+            exit 1
+          fi
+
+          BUILD_TOOLS_VERSION=$(ls -1 "$SDK_DIR/build-tools" | sort -V | tail -n 1)
+          BUILD_TOOLS_DIR="$SDK_DIR/build-tools/$BUILD_TOOLS_VERSION"
+          echo "Using Android build-tools: $BUILD_TOOLS_DIR"
+
+          RAW_APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$RAW_APK" ]; then
+            echo "Expected APK not found at $RAW_APK"
+            exit 1
+          fi
+
+          mkdir -p dist-apk
+          ALIGNED_APK="dist-apk/GreenAI-v1.0-debug-aligned.apk"
+          FINAL_APK="dist-apk/GreenAI-v1.0-debug.apk"
+
+          "$BUILD_TOOLS_DIR/zipalign" -p -f 4 "$RAW_APK" "$ALIGNED_APK"
+
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --key-pass pass:android \
+            --min-sdk-version 24 \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "$FINAL_APK" \
+            "$ALIGNED_APK"
+          rm -f "$ALIGNED_APK"
+
+          echo "=== Verifying 4-byte & page alignment ==="
+          "$BUILD_TOOLS_DIR/zipalign" -c 4 "$FINAL_APK"
+
+          echo "=== Verifying APK signatures ==="
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$FINAL_APK"
+
+          echo "=== Inspecting package badging ==="
+          "$BUILD_TOOLS_DIR/aapt2" dump badging "$FINAL_APK" > dist-apk/badging.txt
+          head -n 15 dist-apk/badging.txt
+          rm -f dist-apk/badging.txt
+
+          APK_BYTES=$(stat -c%s "$FINAL_APK")
+          APK_SHA256=$(sha256sum "$FINAL_APK" | awk '{print $1}')
+          echo "apk_path=$FINAL_APK" >> "$GITHUB_OUTPUT"
+          echo "apk_bytes=$APK_BYTES" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Verified Android APK Summary"
+            echo "- **File**: \`GreenAI-v1.0-debug.apk\`"
+            echo "- **Size**: \`${APK_BYTES}\` bytes"
+            echo "- **SHA-256**: \`${APK_SHA256}\`"
+            echo "- **Signing**: APK Signature Schemes v2 and v3 verified"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish raw APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK_PATH: ${{ steps.package-apk.outputs.apk_path }}
+          APK_BYTES: ${{ steps.package-apk.outputs.apk_bytes }}
+          APK_SHA256: ${{ steps.package-apk.outputs.apk_sha256 }}
+        run: |
+          set -euo pipefail
+          TAG="latest-debug"
+          NOTES_FILE="dist-apk/release-notes.md"
+          printf '%s\n' \
+            "Latest verified Android debug build for **Green AI** (\`com.aistudio.greenai.atm\`, \`minSdk 24\`, Android 14 compatible)." \
+            "" \
+            "- **Direct APK**: Download \`GreenAI-v1.0-debug.apk\` directly below (no \`.zip\` extraction required)." \
+            "- **Size**: \`${APK_BYTES}\` bytes" \
+            "- **SHA-256**: \`${APK_SHA256}\`" \
+            "- **Commit**: \`${GITHUB_SHA}\` (Run #${GITHUB_RUN_NUMBER})" \
+            "- **Signing**: APK Signature Schemes v2 + v3 verified" \
+            "" \
+            "> If you previously installed an earlier Green AI debug build from an older workflow run, uninstall it before installing this build so the persistent signing certificate matches cleanly going forward." \
+            > "$NOTES_FILE"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_PATH" --clobber
+            gh release edit "$TAG" \
+              --title "Green AI Debug APK (Latest)" \
+              --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" "$APK_PATH" \
+              --prerelease \
+              --title "Green AI Debug APK (Latest)" \
+              --notes-file "$NOTES_FILE"
+          fi
+
+      - name: Upload verified APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Green-AI-APK
-          path: app/build/outputs/apk/debug/*.apk
+          path: ${{ steps.package-apk.outputs.apk_path }}
+          if-no-files-found: error
